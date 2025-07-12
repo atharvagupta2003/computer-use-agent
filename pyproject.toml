@@ -1,0 +1,41 @@
+[project]
+name = "agent"
+version = "1.0.0"
+description = "LangGraph Solution Template for MCP"
+authors = [
+    { name = "Atharva Gupta", email = "hello@heuris.co" },
+]
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "sse-starlette>=2.1.0,<2.2.0",
+    "asyncio",
+    "langchain",
+    "langchain-core",
+    "langchain-openai",
+    "langgraph",
+    "openai",
+    "python-dotenv",
+    "e2b",
+    "e2b-desktop",
+    "pydantic>=2.6",
+    "python-dateutil>=2.8",
+]
+
+[project.optional-dependencies]
+dev = ["debugpy", "mypy", "ruff"]
+test = ["pytest", "langgraph-sdk", "requests"]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["agent"]
+[tool.setuptools.package-dir]
+"agent" = "src/agent"
+
+[project.scripts]
+cua = "agent.cli:main"
+computer-use-agent = "agent.cli:main"
