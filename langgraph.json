@@ -1,0 +1,12 @@
+{
+    "name": "LangGraph Solution Template for MCP",
+    "version": "1.0.0",
+    "python_version": "3.12",
+    "dependencies": [
+      "."
+    ],
+    "graphs": {
+      "computer-use-agent": "./src/agent/graph.py:workflow_graph"
+    },
+    "env": ".env"
+  }
