@@ -233,22 +233,30 @@ async def strategic_brain(state: ExecutionState, *, config: dict) -> ExecutionSt
         
         # Get configuration
         agent_config = config.get("configurable", {})
-        api_key = agent_config.get("openai_api_key")
-        if not api_key:
-            try:
-                global_config = get_config()
-                api_key = global_config.openai_api_key
-                model = global_config.model_planner
-            except Exception as e:
-                print(f"Failed to get global config: {e}")
-                api_key = None
-        else:
-            model = agent_config.get("model_planner", "gpt-4o-2024-11-20")
-        
-        if not api_key:
-            print("No API key found in config or environment")
+        try:
+            global_config = get_config()
+            brain_provider = global_config.brain_provider
+            brain_model = global_config.brain_model
+            
+            if brain_provider == "anthropic":
+                api_key = agent_config.get("anthropic_api_key") or global_config.anthropic_api_key
+                if not api_key:
+                    print("No Anthropic API key found in config or environment")
+                    state.status = TaskStatus.failed
+                    state.message_for_user = "Anthropic API key not configured. Please set ANTHROPIC_API_KEY environment variable."
+                    return state
+            else:
+                api_key = agent_config.get("openai_api_key") or global_config.openai_api_key
+                brain_model = global_config.model_planner
+                if not api_key:
+                    print("No OpenAI API key found in config or environment")
+                    state.status = TaskStatus.failed
+                    state.message_for_user = "OpenAI API key not configured. Please set OPENAI_API_KEY environment variable."
+                    return state
+        except Exception as e:
+            print(f"Failed to get global config: {e}")
             state.status = TaskStatus.failed
-            state.message_for_user = "OpenAI API key not configured. Please set OPENAI_API_KEY environment variable."
+            state.message_for_user = f"Configuration error: {str(e)}"
             return state
         
         # Build context for strategic brain
@@ -266,13 +274,22 @@ async def strategic_brain(state: ExecutionState, *, config: dict) -> ExecutionSt
         brain_prompt = create_strategic_brain_prompt(context)
         
         # Create LangChain client with structured output
-        from langchain_openai import ChatOpenAI
-        
-        llm = ChatOpenAI(
-            model=model,
-            api_key=api_key,
-            temperature=0
-        )
+        if brain_provider == "anthropic":
+            from langchain_anthropic import ChatAnthropic
+            
+            llm = ChatAnthropic(
+                model=brain_model,
+                api_key=api_key,
+                temperature=1
+            )
+        else:
+            from langchain_openai import ChatOpenAI
+            
+            llm = ChatOpenAI(
+                model=brain_model,
+                api_key=api_key,
+                temperature=1
+            )
         
         # Use structured output
         structured_llm = llm.with_structured_output(SemanticInstructionSchema, method="function_calling")
