@@ -77,6 +77,11 @@ class AgentConfig(BaseModel):
         default_factory=lambda: int(os.getenv("CUA_ITERATION_LIMIT", "30")),
         description="Safety cap on max executor iterations in a single invocation.",
     )
+    
+    recursion_limit: int = Field(
+        default_factory=lambda: int(os.getenv("CUA_RECURSION_LIMIT", "50")),
+        description="LangGraph recursion limit for brain-executor feedback loops.",
+    )
 
     # ---------------------------------------------------------------------
     # Validators
