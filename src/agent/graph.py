@@ -3,21 +3,29 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Optional
 
 from langgraph.graph import END, START, StateGraph
-
+from langgraph.cache.memory import InMemoryCache
+from langgraph.types import CachePolicy
 from agent.configuration import get_config
 from agent.cua.sandbox import start_desktop_sandbox, get_desktop, _DESKTOP_CACHE
-from agent.prompts import executor_system_prompt
+from agent.prompts import create_strategic_brain_prompt
 from agent.state import (
     ExecutionState, 
     GraphInput, 
+    OutputState,
     TaskStatus, 
     SemanticInstruction, 
-    ExecutorReport, 
     ActionType,
     SemanticInstructionSchema
+)
+from agent.vision_utils import (
+    execute_semantic_instruction,
+    build_brain_context,
+    handle_repeated_action,
+    should_request_human_intervention
 )
 from agent.utils import utcnow
 
@@ -48,28 +56,6 @@ def map_platform_to_environment(platform: str) -> str:
     }
     return mapping.get(platform, "browser")
 
-def launch_application_in_sandbox(sandbox_id: str, platform: str) -> None:
-    """Launch the specified application in the sandbox."""
-    
-    desktop = get_desktop(sandbox_id)
-    if not desktop:
-        raise RuntimeError(f"No desktop sandbox found for ID: {sandbox_id}")
-
-    # Map platform to e2b launch command
-    launch_commands = {
-        "google-chrome": "google-chrome",
-        "firefox": "firefox",
-        "vscode": "code",
-    }
-
-    command = launch_commands.get(platform)
-    if not command:
-        raise ValueError(f"Unknown platform: {platform}")
-    
-    desktop.launch(command)
-    # Wait for application to start
-    desktop.wait(5000)  # 5 seconds
-
 def cleanup_sandbox(sandbox_id: str, graceful: bool = True) -> None:
     """Clean up sandbox resources gracefully."""
     
@@ -87,14 +73,13 @@ def cleanup_sandbox(sandbox_id: str, graceful: bool = True) -> None:
                     pass  # Stream might already be stopped
             
             # Save any work or close applications gracefully
-            # This is platform-specific, but we can try some common shortcuts
             try:
                 # Save any open documents (Ctrl+S)
                 desktop.key_down("ctrl")
                 desktop.key_down("s")
                 desktop.key_up("s")
                 desktop.key_up("ctrl")
-                desktop.wait(1000)  # Wait 1 second
+                desktop.wait(1000)
                 
                 # Close applications gracefully (Alt+F4)
                 desktop.key_down("alt")
@@ -117,48 +102,6 @@ def cleanup_sandbox(sandbox_id: str, graceful: bool = True) -> None:
         if sandbox_id in _DESKTOP_CACHE:
             del _DESKTOP_CACHE[sandbox_id]
 
-def is_screenshot_duplicate(new_screenshot: bytes, previous_screenshots: list[str], threshold: float = 0.95) -> bool:
-    """Check if a screenshot is substantially the same as a previous one."""
-    import hashlib
-    import base64
-    
-    # Quick hash comparison first
-    new_hash = hashlib.md5(new_screenshot).hexdigest()
-    
-    for prev_b64 in previous_screenshots[-5:]:  # Only check last 5 screenshots
-        try:
-            prev_bytes = base64.b64decode(prev_b64)
-            prev_hash = hashlib.md5(prev_bytes).hexdigest()
-            
-            # If hashes match exactly, it's a duplicate
-            if new_hash == prev_hash:
-                return True
-                
-            # For more sophisticated comparison, we could use image similarity
-            # but for now, hash comparison is sufficient for exact duplicates
-            
-        except Exception:
-            continue  # Skip invalid base64
-    
-    return False
-
-def trim_message_history(messages: list[dict], max_messages: int = 20) -> list[dict]:
-    """Trim message history to stay within context limits."""
-    if len(messages) <= max_messages:
-        return messages
-    
-    # Always keep the system message (first message)
-    system_msg = messages[0] if messages and messages[0].get("role") == "system" else None
-    
-    # Keep the most recent messages
-    recent_messages = messages[-(max_messages - 1):] if system_msg else messages[-max_messages:]
-    
-    # Reconstruct with system message at the beginning
-    if system_msg:
-        return [system_msg] + recent_messages
-    else:
-        return recent_messages
-
 # ---------------------------------------------------------------------------
 # Node implementations
 # ---------------------------------------------------------------------------
@@ -167,7 +110,6 @@ async def setup_sandbox(state: ExecutionState, *, config: dict) -> ExecutionStat
     """Set up the sandbox environment for execution."""
     
     # Extract user request from the config
-    # LangGraph passes the user input in different ways depending on how it's invoked
     user_request = ""
     configurable = config.get("configurable", {})
     
@@ -200,16 +142,33 @@ async def setup_sandbox(state: ExecutionState, *, config: dict) -> ExecutionStat
     else:
         sandbox_id = getattr(state, 'sandbox_id', None) or configurable.get("sandbox_id")
         sandbox_url = getattr(state, 'sandbox_url', None) or configurable.get("sandbox_url")
-    
-    # Use existing sandbox if provided, otherwise create new one
+
+    # Check if we can reuse an existing sandbox
+    sandbox_to_use = None
     if sandbox_id and sandbox_url:
+        # Verify if the sandbox is still active
+        try:
+            desktop = get_desktop(sandbox_id)
+            if desktop:
+                print(f"Verified existing sandbox is active: {sandbox_id}")
+                sandbox_to_use = {
+                    "sandbox_id": sandbox_id,
+                    "sandbox_url": sandbox_url
+                }
+            else:
+                print(f"Existing sandbox {sandbox_id} is not active, will create new one")
+        except Exception as e:
+            print(f"Failed to verify existing sandbox {sandbox_id}: {e}, will create new one")
+    
+    # Use verified sandbox or create new one
+    if sandbox_to_use:
         if isinstance(state, dict):
-            state["sandbox_id"] = sandbox_id
-            state["sandbox_url"] = sandbox_url
+            state["sandbox_id"] = sandbox_to_use["sandbox_id"]
+            state["sandbox_url"] = sandbox_to_use["sandbox_url"]
         else:
-            state.sandbox_id = sandbox_id
-            state.sandbox_url = sandbox_url
-        print(f"Using existing sandbox: {sandbox_id}")
+            state.sandbox_id = sandbox_to_use["sandbox_id"]
+            state.sandbox_url = sandbox_to_use["sandbox_url"]
+        print(f"Using existing sandbox: {sandbox_to_use['sandbox_id']}")
     else:
         # Create new sandbox
         print("Creating new sandbox...")
@@ -225,11 +184,44 @@ async def setup_sandbox(state: ExecutionState, *, config: dict) -> ExecutionStat
             state.sandbox_expires_at = sandbox_details.expires_at
         print(f"Created new sandbox: {sandbox_details.sandbox_id}")
     
-    # Set status to in progress
+    # Reset state for new execution and set status to in progress
+    # BUT preserve previous output and user query for continuity
     if isinstance(state, dict):
+        # Preserve previous context
+        previous_output = state.get("message_for_user", "")
+        previous_user_request = state.get("user_request", "")
+        
         state["status"] = TaskStatus.in_progress
+        state["_start_time"] = time.time()
+        state["interaction_count"] = 0
+        state["message_for_user"] = ""  # Reset for new execution
+        state["current_instruction"] = None
+        state["last_executor_report"] = None
+        state["app_launched"] = False
+        state["action_history"] = []
+        state["brain_instruction_history"] = []
+        
+        # Store previous context for continuity
+        state["previous_output"] = previous_output
+        state["previous_user_request"] = previous_user_request
     else:
+        # Preserve previous context
+        previous_output = getattr(state, "message_for_user", "")
+        previous_user_request = getattr(state, "user_request", "")
+        
         state.status = TaskStatus.in_progress
+        state._start_time = time.time()
+        state.interaction_count = 0
+        state.message_for_user = ""  # Reset for new execution
+        state.current_instruction = None
+        state.last_executor_report = None
+        state.app_launched = False
+        state.action_history = []
+        state.brain_instruction_history = []
+        
+        # Store previous context for continuity
+        state.previous_output = previous_output
+        state.previous_user_request = previous_user_request
     
     return state
 
@@ -259,66 +251,19 @@ async def strategic_brain(state: ExecutionState, *, config: dict) -> ExecutionSt
             state.message_for_user = "OpenAI API key not configured. Please set OPENAI_API_KEY environment variable."
             return state
         
-        # Build context for the strategic brain
-        user_request = state.user_request
-        last_report = state.last_executor_report
+        # Build context for strategic brain
+        context = build_brain_context(
+            user_request=state.user_request,
+            interaction_summary=state.get_interaction_summary(),
+            recent_actions=state.get_recent_actions_summary(),
+            recent_brain_instructions=state.get_recent_brain_instructions_summary(),
+            previous_output=state.previous_output,
+            previous_user_request=state.previous_user_request,
+            last_report=state.last_executor_report
+        )
         
-        context_parts = [
-            f"USER REQUEST: {user_request}",
-            f"INTERACTION: {state.get_interaction_summary()}",
-            f"RECENT ACTIONS: {state.get_recent_actions_summary()}",
-        ]
-        
-        if last_report:
-            context_parts.append(f"LAST ACTION: {last_report.action_performed or 'Initial screenshot'}")
-            if last_report.action_result:
-                context_parts.append(f"ACTION RESULT: {last_report.action_result}")
-            if last_report.error:
-                context_parts.append(f"ERROR: {last_report.error}")
-            if last_report.elements_found:
-                context_parts.append(f"ELEMENTS FOUND: {', '.join(last_report.elements_found)}")
-        
-        context = "\n".join(context_parts)
-        
-        # Create the strategic brain prompt
-        brain_prompt = f"""You are the strategic brain of a computer use agent. Your job is to analyze the current screen and give semantic instructions to a vision-capable executor.
-
-{context}
-
-You will be shown a screenshot of the current screen. Based on what you see and the user's request, give a semantic instruction about what to do next.
-
-IMPORTANT: You give HIGH-LEVEL SEMANTIC INSTRUCTIONS, not exact coordinates. The executor has vision capabilities and will find the elements you describe.
-
-Available action types and how to use them:
-- screenshot: Take a screenshot to see current state
-- click_element: Click on a described element (e.g., "first search result", "login button", "search box")
-- type_text: Type text into the currently focused element
-- press_key: Press keys like enter, tab, escape
-- scroll: Scroll up or down
-- wait: Wait for specified seconds
-- navigate: Navigate to a URL
-
-Your response should include:
-1. action_type: The type of action to perform
-2. description: Clear description of what you want to accomplish
-3. target_element: Description of the element to interact with (for click_element)
-4. text_content: Text to type (for type_text)
-5. key_sequence: Keys to press (for press_key)
-6. scroll_direction: Direction to scroll (for scroll)
-7. wait_seconds: Time to wait (for wait)
-8. url: URL to navigate to (for navigate)
-9. reasoning: Why this action is needed
-10. is_task_complete: Whether the user's request is fully completed
-11. completion_message: Message to show user when task is complete
-
-Examples of good semantic instructions:
-- "Click on the first search result about Brisbane startups"
-- "Click on the search box at the top of the page"
-- "Click on the link that says 'Top 10 Startups'"
-- "Scroll down to see more search results"
-- "Type the search query into the search box"
-
-Focus on making strategic progress toward the user's goal. Avoid repeating the same action multiple times."""
+        # Create the strategic brain prompt using utility function
+        brain_prompt = create_strategic_brain_prompt(context)
         
         # Create LangChain client with structured output
         from langchain_openai import ChatOpenAI
@@ -336,63 +281,167 @@ Focus on making strategic progress toward the user's goal. Avoid repeating the s
         messages = [{"role": "user", "content": brain_prompt}]
         
         # Add screenshot if available
-        if last_report and last_report.screenshot_b64:
+        if state.last_executor_report and state.last_executor_report.screenshot_b64:
             messages.append({
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Current screen:"},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{last_report.screenshot_b64}"}}
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{state.last_executor_report.screenshot_b64}"
+                        }
+                    }
                 ]
             })
         
-        print("Strategic brain analyzing screen and creating instruction...")
-        try:
-            instruction_response = await structured_llm.ainvoke(messages)
-            print(f"Brain instruction: {instruction_response.action_type} - {instruction_response.description}")
-            
-            # Check for repeated actions
-            action_desc = f"{instruction_response.action_type}:{instruction_response.target_element or instruction_response.description}"
-            if state.is_repeating_action(action_desc):
-                print(f"Detected repeated action: {action_desc}. Trying alternative approach.")
-                # Modify the instruction to break the loop
-                if instruction_response.action_type == "click_element":
-                    instruction_response.action_type = "scroll"
-                    instruction_response.description = "Scroll to find different elements"
-                    instruction_response.target_element = ""
-                    instruction_response.scroll_direction = "down"
-                    instruction_response.reasoning = "Breaking repetitive clicking by scrolling to find new elements"
-            
-            # Convert to SemanticInstruction object
-            instruction = SemanticInstruction(
-                action_type=ActionType(instruction_response.action_type),
-                description=instruction_response.description,
-                target_element=instruction_response.target_element,
-                text_content=instruction_response.text_content,
-                key_sequence=instruction_response.key_sequence,
-                scroll_direction=instruction_response.scroll_direction,
-                wait_seconds=instruction_response.wait_seconds,
-                url=instruction_response.url,
-                reasoning=instruction_response.reasoning,
-                is_task_complete=instruction_response.is_task_complete,
-                completion_message=instruction_response.completion_message
-            )
-            
-            # Store instruction in state
-            state.set_brain_instruction(instruction)
-            
-            # Check if task is complete
-            if instruction.is_task_complete:
-                state.status = TaskStatus.completed
-                state.message_for_user = instruction.completion_message
-                print(f"Task completed: {instruction.completion_message}")
-            
+        # Get instruction from brain
+        instruction_response = structured_llm.invoke(messages)
+        
+        # Check if human intervention is needed BEFORE processing the instruction
+        needs_intervention, intervention_reason = should_request_human_intervention(state, instruction_response)
+        if needs_intervention:
+            print(f"Human intervention needed: {intervention_reason}")
+            state.status = TaskStatus.human_intervention_required
+            state.human_intervention_reason = intervention_reason
+            state.preserve_sandbox = True  # Don't clean up sandbox for human intervention
+            state.message_for_user = f"Human intervention required: {intervention_reason}"
             return state
+        
+        print(f"Brain instruction: {instruction_response.action_type} - {instruction_response.description}")
+        
+        # Handle repeated actions using utility function
+        action_desc = f"{instruction_response.action_type}:{instruction_response.target_element or instruction_response.description}"
+        instruction_response = handle_repeated_action(instruction_response, state, action_desc)
+        
+        # Check for high interaction count and force different approaches or completion
+        if state.interaction_count >= 5 and not instruction_response.is_task_complete:
+            # Instead of forcing completion, try different approaches based on context
+            if (instruction_response.action_type == "scroll" and 
+                state.interaction_count >= 12):
+                print(f"High interaction count ({state.interaction_count}) with scroll action. Trying to go back and restart.")
+                instruction_response.action_type = "press_key"
+                instruction_response.description = "Go back to previous page to try a different approach"
+                instruction_response.key_sequence = ["alt+Left"]
+                instruction_response.reasoning = "High interaction count with scrolling suggests current approach isn't working"
+            elif (instruction_response.action_type == "click_element" and 
+                  state.interaction_count >= 15):
+                print(f"High interaction count ({state.interaction_count}) with click_element action. Trying to go back and restart.")
+                instruction_response.action_type = "press_key"
+                instruction_response.description = "Go back to previous page to try a different approach"
+                instruction_response.key_sequence = ["alt+Left"]
+                instruction_response.reasoning = "High interaction count with clicking suggests current approach isn't working"
+            elif (instruction_response.action_type == "type_text" and 
+                  state.interaction_count >= 8):
+                print(f"High interaction count ({state.interaction_count}) with type_text action. Trying to press Enter.")
+                instruction_response.action_type = "press_key"
+                instruction_response.description = "Press Enter to execute the search"
+                instruction_response.key_sequence = ["enter"]
+                instruction_response.reasoning = "High interaction count with typing suggests we should execute the search"
+            elif state.interaction_count >= 20:
+                # Only mark as incomplete after trying many different approaches
+                print(f"Very high interaction count ({state.interaction_count}). Marking as incomplete due to being stuck.")
+                instruction_response.is_task_complete = True
+                instruction_response.completion_message = "Task could not be completed due to repeated failed attempts. The requested information may not be easily accessible or the approach needs to be reconsidered."
+        
+        # Convert to SemanticInstruction object
+        instruction = SemanticInstruction(
+            action_type=ActionType(instruction_response.action_type),
+            description=instruction_response.description,
+            target_element=instruction_response.target_element,
+            text_content=instruction_response.text_content,
+            key_sequence=instruction_response.key_sequence,
+            scroll_direction=instruction_response.scroll_direction,
+            wait_seconds=instruction_response.wait_seconds,
+            url=instruction_response.url,
+            reasoning=instruction_response.reasoning,
+            is_task_complete=instruction_response.is_task_complete,
+            completion_message=instruction_response.completion_message
+        )
+        
+        # Check for repeated brain instructions BEFORE storing
+        brain_instruction_desc = f"{instruction.action_type.value}:{instruction.description}"
+        if state.is_repeating_brain_instruction(brain_instruction_desc):
+            print(f"Detected repeated brain instruction: {brain_instruction_desc}")
+            print(f"Recent brain instructions: {state.get_recent_brain_instructions_summary()}")
             
-        except Exception as e:
-            print(f"Failed to get brain instruction: {e}")
-            state.status = TaskStatus.failed
-            state.message_for_user = f"Brain analysis failed: {str(e)}"
-            return state
+            # Force a different approach or completion
+            if instruction.action_type == ActionType.click_element:
+                # If we keep trying to click the same element, try scrolling or going back
+                if state.interaction_count >= 15:
+                    print("High interaction count with repeated clicking. Trying to go back and restart approach.")
+                    instruction.action_type = ActionType.press_key
+                    instruction.description = "Go back to previous page to try a different approach"
+                    instruction.target_element = ""
+                    instruction.key_sequence = ["alt+Left"]
+                    instruction.reasoning = "Going back to try a different approach after repeated clicking failed"
+                else:
+                    print("Changing approach from repeated clicking to scrolling.")
+                    instruction.action_type = ActionType.scroll
+                    instruction.description = "Scroll to find different elements or content"
+                    instruction.target_element = ""
+                    instruction.scroll_direction = "down"
+                    instruction.reasoning = "Breaking repetitive clicking by scrolling to find new elements"
+            elif instruction.action_type == ActionType.scroll:
+                # If we keep scrolling, try going back or taking a different approach
+                if state.interaction_count >= 12:
+                    print("Repeated scrolling detected. Trying to go back and restart approach.")
+                    instruction.action_type = ActionType.press_key
+                    instruction.description = "Go back to previous page to try a different approach"
+                    instruction.target_element = ""
+                    instruction.key_sequence = ["alt+Left"]
+                    instruction.reasoning = "Going back to try a different approach after repeated scrolling failed"
+                else:
+                    print("Changing approach from repeated scrolling to navigation.")
+                    instruction.action_type = ActionType.navigate
+                    instruction.description = "Navigate to a search engine to try a different approach"
+                    instruction.url = "https://www.google.com"
+                    instruction.reasoning = "Breaking repetitive scrolling by navigating to a fresh search page"
+            elif instruction.action_type == ActionType.type_text:
+                # If we keep typing the same thing, press Enter
+                print("Changing approach from repeated typing to pressing Enter.")
+                instruction.action_type = ActionType.press_key
+                instruction.description = "Press Enter to execute the search"
+                instruction.text_content = ""
+                instruction.key_sequence = ["enter"]
+                instruction.reasoning = "Breaking repetitive typing by pressing Enter to execute the search"
+            elif instruction.action_type == ActionType.screenshot:
+                # If we keep taking screenshots, try going back
+                print("Repeated screenshots detected. Trying to go back and restart approach.")
+                instruction.action_type = ActionType.press_key
+                instruction.description = "Go back to previous page to try a different approach"
+                instruction.target_element = ""
+                instruction.key_sequence = ["alt+Left"]
+                instruction.reasoning = "Going back to try a different approach after repeated screenshots"
+            else:
+                # For other repeated actions, try going back first, then complete if still stuck
+                if state.interaction_count >= 15:
+                    print("High interaction count with repeated actions. Marking as incomplete due to being stuck.")
+                    instruction.is_task_complete = True
+                    instruction.completion_message = "Task could not be completed due to repeated failed attempts. The requested information may not be easily accessible or the approach needs to be reconsidered."
+                else:
+                    print("Changing approach from repeated action to going back.")
+                    instruction.action_type = ActionType.press_key
+                    instruction.description = "Go back to previous page to try a different approach"
+                    instruction.target_element = ""
+                    instruction.key_sequence = ["alt+Left"]
+                    instruction.reasoning = "Going back to try a different approach after repeated actions failed"
+        
+        # Store instruction in state
+        state.set_brain_instruction(instruction)
+        
+        # Check if task is complete
+        if instruction.is_task_complete:
+            state.status = TaskStatus.completed
+            state.message_for_user = instruction.completion_message
+            print(f"Task completed: {instruction.completion_message}")
+        
+        return state
+        
+    except Exception as e:
+        print(f"Failed to get brain instruction: {e}")
+        state.status = TaskStatus.failed
+        state.message_for_user = f"Brain analysis failed: {str(e)}"
+        return state
         
     except Exception as e:
         print(f"Error in strategic brain: {e}")
@@ -400,7 +449,7 @@ Focus on making strategic progress toward the user's goal. Avoid repeating the s
         state.message_for_user = f"Brain error: {str(e)}"
         return state
 
-async def vision_executor(state: ExecutionState) -> ExecutionState:
+async def vision_executor(state: ExecutionState, *, config: dict) -> ExecutionState:
     """Vision-capable executor that interprets semantic instructions and performs actions."""
     
     try:
@@ -409,11 +458,12 @@ async def vision_executor(state: ExecutionState) -> ExecutionState:
         # Increment interaction counter
         state.increment_interaction()
         
-        # Check for max interactions
-        if state.is_max_interactions_reached():
-            print("Maximum interactions reached")
+        # Get config and check for max interactions
+        agent_config = get_config()
+        if state.interaction_count >= agent_config.iteration_limit:
+            print(f"Maximum interactions reached ({agent_config.iteration_limit})")
             state.status = TaskStatus.failed
-            state.message_for_user = "Maximum interactions reached. Task may be too complex or stuck in a loop."
+            state.message_for_user = f"Maximum interactions reached ({agent_config.iteration_limit}). Task may be too complex or stuck in a loop."
             return state
         
         # Get desktop
@@ -445,7 +495,7 @@ async def vision_executor(state: ExecutionState) -> ExecutionState:
                 state.message_for_user = f"Failed to launch application: {str(e)}"
                 return state
         
-        # Execute the semantic instruction from strategic brain
+        # Execute the semantic instruction
         instruction = state.current_instruction
         action_performed = None
         action_result = None
@@ -455,97 +505,89 @@ async def vision_executor(state: ExecutionState) -> ExecutionState:
         if instruction:
             print(f"Executing instruction: {instruction.action_type} - {instruction.description}")
             
-            try:
-                if instruction.action_type == ActionType.screenshot:
-                    # Just take screenshot - no other action needed
-                    action_performed = "screenshot"
-                    action_result = "Screenshot taken"
-                    
-                elif instruction.action_type == ActionType.click_element:
-                    # Use the existing computer tool to find and click elements
-                    if instruction.target_element:
-                        # For now, use a simple heuristic approach
-                        # In a real implementation, you'd use vision models to find elements
-                        action_performed = f"click_element: {instruction.target_element}"
+            # For click_element actions, use OpenAI Computer Use model for visual analysis
+            if instruction.action_type == ActionType.click_element:
+                try:
+                    # Take screenshot first
+                    screenshot_data = desktop.screenshot()
+                    if screenshot_data:
+                        # Convert screenshot to base64 for OpenAI API
+                        import base64
+                        screenshot_b64 = base64.b64encode(screenshot_data).decode('utf-8')
                         
-                        # Simple heuristic: try common click locations based on element description
-                        if "search" in instruction.target_element.lower():
-                            # Click on search box area
-                            desktop.left_click(400, 100)
-                            action_result = f"Clicked on search element: {instruction.target_element}"
-                        elif "first" in instruction.target_element.lower() and "result" in instruction.target_element.lower():
-                            # Click on first search result
-                            desktop.left_click(400, 200)
-                            action_result = f"Clicked on first search result: {instruction.target_element}"
-                        elif "link" in instruction.target_element.lower():
-                            # Click on a link
-                            desktop.left_click(400, 300)
-                            action_result = f"Clicked on link: {instruction.target_element}"
+                        # Use OpenAI Computer Use model to analyze screenshot and click
+                        from agent.cua.client import take_action
+                        config = get_config()
+                        
+                        # Create messages for OpenAI Computer Use model
+                        messages = [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": f"Please analyze this screenshot and click on: {instruction.target_element}. Description: {instruction.description}"
+                                    },
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:image/png;base64,{screenshot_b64}"
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                        
+                        # Call OpenAI Computer Use model
+                        response = await take_action(
+                            messages=messages,
+                            model="gpt-4o",  # Use vision-capable model
+                            api_key=config.openai_api_key,
+                            environment=map_platform_to_environment(state.application_platform or "google-chrome")
+                        )
+                        
+                        # Process the response and execute the action
+                        if response and 'choices' in response:
+                            choice = response['choices'][0]
+                            if 'message' in choice and 'tool_calls' in choice['message']:
+                                tool_calls = choice['message']['tool_calls']
+                                if tool_calls:
+                                    tool_call = tool_calls[0]
+                                    if tool_call['function']['name'] == 'computer':
+                                        import json
+                                        args = json.loads(tool_call['function']['arguments'])
+                                        
+                                        # Execute the computer action
+                                        if args.get('action') == 'click' and 'coordinate' in args:
+                                            x, y = args['coordinate']
+                                            desktop.left_click(x, y)
+                                            action_performed = f"click_element: {instruction.target_element}"
+                                            action_result = f"Clicked on {instruction.target_element} at coordinates ({x}, {y})"
+                                            elements_found = [instruction.target_element]
+                                            print(f"Successfully clicked on {instruction.target_element} at ({x}, {y})")
+                                        else:
+                                            error = f"Unexpected action from model: {args.get('action')}"
+                                    else:
+                                        error = f"Unexpected tool call: {tool_call['function']['name']}"
+                                else:
+                                    error = "No tool calls in response"
+                            else:
+                                error = "No tool calls in message"
                         else:
-                            # Generic click in content area
-                            desktop.left_click(400, 250)
-                            action_result = f"Clicked on element: {instruction.target_element}"
-                        
-                        elements_found.append(instruction.target_element)
+                            error = "Invalid response from OpenAI model"
+                            
                     else:
-                        error = "No target element specified for click_element action"
+                        error = "Failed to take screenshot for visual analysis"
                         
-                elif instruction.action_type == ActionType.type_text:
-                    if instruction.text_content:
-                        desktop.write(instruction.text_content)
-                        action_performed = f"type_text: {instruction.text_content}"
-                        action_result = f"Typed: {instruction.text_content}"
-                        print(f"Typed: {instruction.text_content}")
-                    else:
-                        error = "No text content provided for type_text action"
-                        
-                elif instruction.action_type == ActionType.press_key:
-                    if instruction.key_sequence:
-                        for key in instruction.key_sequence:
-                            desktop.press(key.lower())
-                            print(f"Pressed key: {key}")
-                        action_performed = f"press_key: {instruction.key_sequence}"
-                        action_result = f"Pressed keys: {', '.join(instruction.key_sequence)}"
-                    else:
-                        error = "No key sequence provided for press_key action"
-                        
-                elif instruction.action_type == ActionType.scroll:
-                    direction = instruction.scroll_direction
-                    amount = 3  # Default scroll amount
-                    desktop.scroll(direction, amount)
-                    action_performed = f"scroll {direction}"
-                    action_result = f"Scrolled {direction} by {amount}"
-                    print(f"Scrolled {direction} by {amount}")
-                    
-                elif instruction.action_type == ActionType.wait:
-                    wait_time = instruction.wait_seconds
-                    desktop.wait(wait_time * 1000)  # e2b expects milliseconds
-                    action_performed = f"wait {wait_time}s"
-                    action_result = f"Waited {wait_time} seconds"
-                    print(f"Waited {wait_time} seconds")
-                    
-                elif instruction.action_type == ActionType.navigate:
-                    if instruction.url:
-                        # Navigate by typing URL in address bar
-                        desktop.key_down("ctrl")
-                        desktop.key_down("l")
-                        desktop.key_up("l")
-                        desktop.key_up("ctrl")
-                        desktop.wait(500)
-                        desktop.write(instruction.url)
-                        desktop.press("enter")
-                        action_performed = f"navigate to {instruction.url}"
-                        action_result = f"Navigated to {instruction.url}"
-                        print(f"Navigated to {instruction.url}")
-                    else:
-                        error = "No URL provided for navigate action"
-                        
-                # Wait a bit for action to complete
-                desktop.wait(1000)
-                
-            except Exception as e:
-                error = f"Action execution failed: {str(e)}"
-                print(f"Action execution error: {e}")
+                except Exception as e:
+                    error = f"Visual analysis failed: {str(e)}"
+                    print(f"Visual analysis error: {e}")
+            
+            else:
+                # For non-click actions, use the existing utility function
+                action_performed, action_result, error, elements_found = execute_semantic_instruction(
+                    desktop, instruction
+                )
         
         # Always take a screenshot after action to report current state
         try:
@@ -591,25 +633,102 @@ async def cleanup_node(state) -> ExecutionState:
     """Clean up sandbox resources when execution is complete."""
     
     try:
-        # Wait 20 seconds after task completion before cleanup
         status = get_state_field(state, "status", "")
-        print(f"Cleanup node: status={status}, type={type(status)}")
+        preserve_sandbox = get_state_field(state, "preserve_sandbox", False)
+        
+        print(f"Cleanup node: status={status}, type={type(status)}, preserve_sandbox={preserve_sandbox}")
+        
+        # Ensure the final message is preserved and displayed immediately
+        final_message = get_state_field(state, "message_for_user", "")
+        if final_message:
+            print(f"FINAL RESULT: {final_message}")
         
         # Handle both enum and string status values
         if status == TaskStatus.completed or str(status) == "completed":
-            print("Task completed. Waiting 20 seconds before cleanup...")
-            await asyncio.sleep(20)
-            print("20 seconds elapsed, proceeding with cleanup...")
+            # Ensure we have a completion message
+            if not final_message:
+                set_state_field(state, "message_for_user", "Task completed successfully.")
+                final_message = "Task completed successfully."
+                print(f"FINAL RESULT: {final_message}")
         
-        sandbox_id = get_state_field(state, "sandbox_id", "")
-        if sandbox_id:
-            cleanup_sandbox(sandbox_id, graceful=True)
-            print("Sandbox cleanup completed successfully")
+        # Clean up sandbox in background without blocking the final result (only if not preserving)
+        if not preserve_sandbox:
+            sandbox_id = get_state_field(state, "sandbox_id", "")
+            if sandbox_id:
+                # Schedule cleanup without waiting for it
+                asyncio.create_task(cleanup_sandbox_async(sandbox_id))
+                print("Sandbox cleanup scheduled")
+        else:
+            print("Sandbox preserved for human intervention")
+        
+        # Return the final state immediately so the user gets the result
+        return state
+        
     except Exception as e:
         print(f"Cleanup failed: {e}")
-        set_state_field(state, "message_for_user", f"Cleanup failed: {e}")
+        # Even if cleanup fails, preserve any existing result
+        existing_message = get_state_field(state, "message_for_user", "")
+        if not existing_message:
+            set_state_field(state, "message_for_user", f"Task completed but cleanup failed: {e}")
+        return state
+
+
+async def create_final_output(state) -> OutputState:
+    """Create the final output state to return to the user."""
     
-    return state
+    try:
+        # Calculate execution time if we have a start time
+        execution_time = 0.0
+        if hasattr(state, '_start_time') and state._start_time is not None:
+            execution_time = time.time() - state._start_time
+        
+        # Check if this is human intervention - if so, preserve sandbox and don't clean up
+        status = get_state_field(state, "status", "")
+        preserve_sandbox = get_state_field(state, "preserve_sandbox", False)
+        
+        if status == TaskStatus.human_intervention_required or str(status) == "human_intervention_required":
+            print("Human intervention required - preserving sandbox and creating output")
+            # Don't schedule any cleanup for human intervention
+        else:
+            # For completed/failed tasks, schedule cleanup in background
+            sandbox_id = get_state_field(state, "sandbox_id", "")
+            if sandbox_id and not preserve_sandbox:
+                asyncio.create_task(cleanup_sandbox_async(sandbox_id))
+                print("Sandbox cleanup scheduled in background")
+        
+        # Create the output state from the execution state
+        output_state = OutputState.from_execution_state(state, execution_time)
+        
+        print(f"FINAL OUTPUT CREATED:")
+        print(f"  Status: {output_state.status}")
+        print(f"  Answer: {output_state.answer}")
+        print(f"  Interactions: {output_state.total_interactions}")
+        print(f"  Execution Time: {output_state.execution_time_seconds:.1f}s")
+        print(f"  Requires Human Intervention: {output_state.requires_human_intervention}")
+        print(f"  Sandbox Preserved: {output_state.sandbox_preserved}")
+        
+        return output_state
+        
+    except Exception as e:
+        print(f"Error creating final output: {e}")
+        # Return a failure output state
+        return OutputState(
+            status=TaskStatus.failed,
+            answer=f"Failed to create final output: {str(e)}",
+            user_request=getattr(state, 'user_request', ''),
+            error_message=str(e)
+        )
+
+
+async def cleanup_sandbox_async(sandbox_id: str) -> None:
+    """Asynchronously clean up sandbox resources."""
+    try:
+        print("Starting background sandbox cleanup...")
+        await asyncio.sleep(5)  # Brief delay to let the result return first
+        cleanup_sandbox(sandbox_id, graceful=True)
+        print("Background sandbox cleanup completed")
+    except Exception as e:
+        print(f"Background cleanup failed: {e}")
 
 # ---------------------------------------------------------------------------
 # Conditional logic
@@ -628,6 +747,9 @@ def should_continue_from_brain(state) -> str:
     elif status == TaskStatus.completed or str(status) == "completed":
         print("Going to cleanup due to completed status")
         return "cleanup"
+    elif status == TaskStatus.human_intervention_required or str(status) == "human_intervention_required":
+        print("Going to final_output due to human intervention required")
+        return "final_output"
     else:
         print("Going to executor")
         return "executor"
@@ -645,6 +767,9 @@ def should_continue_from_executor(state) -> str:
     elif status == TaskStatus.completed or str(status) == "completed":
         print("Going to cleanup due to completed status")
         return "cleanup"
+    elif status == TaskStatus.human_intervention_required or str(status) == "human_intervention_required":
+        print("Going to final_output due to human intervention required")
+        return "final_output"
     else:
         print("Going back to brain for next decision")
         return "brain"
@@ -652,14 +777,15 @@ def should_continue_from_executor(state) -> str:
 def create_graph() -> StateGraph:
     """Create the Computer Use Agent graph with semantic brain-executor feedback loop."""
     
-    # Create the graph with input schema
-    graph = StateGraph(ExecutionState, input=GraphInput)
+    # Create the graph with input schema and increased recursion limit
+    graph = StateGraph(ExecutionState, input=GraphInput, output=OutputState)
     
     # Add nodes
-    graph.add_node("setup_sandbox", setup_sandbox)
-    graph.add_node("brain", strategic_brain)
-    graph.add_node("executor", vision_executor)
-    graph.add_node("cleanup", cleanup_node)
+    graph.add_node("setup_sandbox", setup_sandbox, cache_policy=CachePolicy())
+    graph.add_node("brain", strategic_brain, cache_policy=CachePolicy())
+    graph.add_node("executor", vision_executor, cache_policy=CachePolicy())
+    graph.add_node("cleanup", cleanup_node, cache_policy=CachePolicy())
+    graph.add_node("final_output", create_final_output, cache_policy=CachePolicy())
     
     # Add edges
     graph.add_edge(START, "setup_sandbox")
@@ -672,6 +798,7 @@ def create_graph() -> StateGraph:
         {
             "executor": "executor",  # Go to executor to perform action
             "cleanup": "cleanup",    # Go to cleanup if failed/completed
+            "final_output": "final_output",  # Go to final output if human intervention required
         }
     )
     
@@ -682,17 +809,20 @@ def create_graph() -> StateGraph:
         {
             "brain": "brain",        # Go back to brain for next decision
             "cleanup": "cleanup",    # Go to cleanup if failed/completed
+            "final_output": "final_output",  # Go to final output if human intervention required
         }
     )
     
-    graph.add_edge("cleanup", END)
+    # After cleanup, create final output
+    graph.add_edge("cleanup", "final_output")
+    graph.add_edge("final_output", END)
     
     return graph
 
 # Legacy functions for backward compatibility
-async def executor(state: ExecutionState) -> ExecutionState:
+async def executor(state: ExecutionState, *, config: dict) -> ExecutionState:
     """Legacy executor function - redirects to new vision_executor."""
-    return await vision_executor(state)
+    return await vision_executor(state, config=config)
 
 async def planner_node(state: ExecutionState, *, config: dict) -> ExecutionState:
     """Legacy planner function - redirects to new strategic_brain."""
@@ -700,7 +830,12 @@ async def planner_node(state: ExecutionState, *, config: dict) -> ExecutionState
 
 
 # Create and compile the graph
-workflow_graph = create_graph().compile()
+workflow_graph = create_graph().compile(cache=InMemoryCache())
 workflow_graph.name = "Computer Use Agent"
+
+# Note: To use the recursion limit from config, invoke the graph like this:
+# from agent.configuration import get_config
+# config = get_config()
+# result = workflow_graph.invoke(input_data, config={"recursion_limit": config.recursion_limit})
 
 __all__ = ["workflow_graph"]
