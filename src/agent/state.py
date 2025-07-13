@@ -18,8 +18,14 @@ from langgraph.graph import MessagesState
 from pydantic import BaseModel, Field, validator, root_validator
 
 __all__ = [
-    "GraphInput",
+    "TaskStatus",
+    "ActionType", 
+    "SemanticInstruction",
+    "ExecutorReport",
     "ExecutionState",
+    "GraphInput",
+    "OutputState",
+    "SemanticInstructionSchema",
     "Status",
 ]
 
@@ -45,6 +51,7 @@ class TaskStatus(str, Enum):
     in_progress = "in_progress"
     completed = "completed"
     failed = "failed"
+    human_intervention_required = "human_intervention_required"
 
 
 class ActionType(str, Enum):
@@ -127,11 +134,22 @@ class ExecutionState(BaseModel):
     current_instruction: Optional[SemanticInstruction] = None
     last_executor_report: Optional[ExecutorReport] = None
     interaction_count: int = 0
-    max_interactions: int = 30  # Prevent infinite loops
     
     # Action history for loop prevention
     action_history: List[str] = Field(default_factory=list)
     max_history_length: int = 10
+    
+    # Brain instruction history for loop detection
+    brain_instruction_history: List[str] = Field(default_factory=list)
+    max_brain_history_length: int = 10
+    
+    # Previous context for continuity between chat sessions
+    previous_output: str = ""
+    previous_user_request: str = ""
+    
+    # Human intervention tracking
+    human_intervention_reason: str = ""
+    preserve_sandbox: bool = False
     
     # Conversation tracking
     conversation_turn: int = 0
@@ -145,6 +163,9 @@ class ExecutionState(BaseModel):
     execution_plan: List[dict] = Field(default_factory=list)
     current_step_index: int = 0
     planning_completed: bool = False
+    
+    # Internal timing
+    _start_time: Optional[float] = None
     
     def add_screenshot(self, screenshot_data) -> None:
         """Add a screenshot to the state."""
@@ -188,6 +209,13 @@ class ExecutionState(BaseModel):
         # Keep history limited
         if len(self.action_history) > self.max_history_length:
             self.action_history = self.action_history[-self.max_history_length:]
+        
+        # Add to brain instruction history for loop detection
+        brain_instruction_desc = f"{instruction.action_type.value}:{instruction.description}"
+        self.brain_instruction_history.append(brain_instruction_desc)
+        # Keep brain history limited
+        if len(self.brain_instruction_history) > self.max_brain_history_length:
+            self.brain_instruction_history = self.brain_instruction_history[-self.max_brain_history_length:]
     
     def set_executor_report(self, report: ExecutorReport) -> None:
         """Set the last executor report."""
@@ -200,7 +228,9 @@ class ExecutionState(BaseModel):
     
     def is_max_interactions_reached(self) -> bool:
         """Check if maximum interactions have been reached."""
-        return self.interaction_count >= self.max_interactions
+        from agent.configuration import get_config
+        agent_config = get_config()
+        return self.interaction_count >= agent_config.iteration_limit
     
     def is_repeating_action(self, action_desc: str, max_repeats: int = 3) -> bool:
         """Check if an action is being repeated too many times."""
@@ -209,7 +239,9 @@ class ExecutionState(BaseModel):
     
     def get_interaction_summary(self) -> str:
         """Get a summary of the current interaction state."""
-        return f"Interaction {self.interaction_count}/{self.max_interactions}"
+        from agent.configuration import get_config
+        agent_config = get_config()
+        return f"Interaction {self.interaction_count}/{agent_config.iteration_limit}"
     
     def get_recent_actions_summary(self) -> str:
         """Get a summary of recent actions for context."""
@@ -218,11 +250,27 @@ class ExecutionState(BaseModel):
         recent = self.action_history[-5:]  # Last 5 actions
         return f"Recent actions: {' -> '.join(recent)}"
 
+    def is_repeating_brain_instruction(self, instruction_desc: str, max_repeats: int = 3) -> bool:
+        """Check if the brain is giving the same instruction repeatedly."""
+        if len(self.brain_instruction_history) < max_repeats:
+            return False
+        
+        # Check if the last 3 instructions are the same
+        recent_instructions = self.brain_instruction_history[-max_repeats:]
+        return all(instr == instruction_desc for instr in recent_instructions)
+    
+    def get_recent_brain_instructions_summary(self) -> str:
+        """Get a summary of recent brain instructions for context."""
+        if not self.brain_instruction_history:
+            return "No previous brain instructions"
+        recent = self.brain_instruction_history[-5:]  # Last 5 instructions
+        return f"Recent brain instructions: {' -> '.join(recent)}"
+
     # Legacy methods for backward compatibility
     def get_current_step(self) -> Optional[dict]:
         """Legacy method - returns None in new architecture."""
         return None
-    
+
     def mark_current_step_completed(self, result: Optional[str] = None) -> None:
         """Legacy method - no-op in new architecture."""
         pass
@@ -252,3 +300,81 @@ class ExecutionState(BaseModel):
 class GraphInput(BaseModel):
     """Input schema for the graph."""
     user_request: str
+
+
+class OutputState(BaseModel):
+    """Output state returned when the graph execution completes."""
+    
+    # Final result information
+    status: TaskStatus
+    answer: str = ""  # The final answer to the user's request
+    user_request: str = ""  # Original user request for context
+    
+    # Execution metadata
+    total_interactions: int = 0
+    execution_time_seconds: float = 0.0
+    
+    # Additional context
+    error_message: str = ""  # Error details if status is failed
+    screenshots_taken: int = 0
+    actions_performed: List[str] = Field(default_factory=list)
+    
+    # Human intervention details
+    human_intervention_reason: str = ""  # Reason for human intervention if required
+    sandbox_preserved: bool = False  # Whether sandbox was preserved for human use
+    
+    # Success indicators
+    task_completed_successfully: bool = False
+    requires_human_intervention: bool = False
+    
+    def __init__(self, **data):
+        super().__init__(**data)
+        # Set success indicator based on status
+        self.task_completed_successfully = (self.status == TaskStatus.completed)
+        self.requires_human_intervention = (self.status == TaskStatus.human_intervention_required)
+    
+    @classmethod
+    def from_execution_state(cls, execution_state: ExecutionState, execution_time: float = 0.0) -> "OutputState":
+        """Create an OutputState from an ExecutionState."""
+        
+        # Determine the final answer
+        answer = execution_state.message_for_user or ""
+        
+        # If no specific answer but task completed, provide a generic completion message
+        if not answer and execution_state.status == TaskStatus.completed:
+            answer = "Task completed successfully."
+        
+        # If task failed, use error message as answer
+        if execution_state.status == TaskStatus.failed:
+            answer = execution_state.message_for_user or "Task failed due to an error."
+        
+        # If human intervention required, use intervention message as answer
+        if execution_state.status == TaskStatus.human_intervention_required:
+            answer = execution_state.message_for_user or "Human intervention required to proceed."
+        
+        return cls(
+            status=execution_state.status,
+            answer=answer,
+            user_request=execution_state.user_request,
+            total_interactions=execution_state.interaction_count,
+            execution_time_seconds=execution_time,
+            error_message=execution_state.message_for_user if execution_state.status == TaskStatus.failed else "",
+            human_intervention_reason=getattr(execution_state, "human_intervention_reason", ""),
+            sandbox_preserved=getattr(execution_state, "preserve_sandbox", False),
+            screenshots_taken=len(execution_state.screenshots),
+            actions_performed=execution_state.action_history[-10:] if execution_state.action_history else [],
+            task_completed_successfully=(execution_state.status == TaskStatus.completed),
+            requires_human_intervention=(execution_state.status == TaskStatus.human_intervention_required)
+        )
+    
+    def get_formatted_result(self) -> str:
+        """Get a formatted string representation of the result."""
+        if self.task_completed_successfully:
+            return f"✓ Task Completed Successfully\n\nAnswer: {self.answer}\n\nExecution Summary:\n- Total Interactions: {self.total_interactions}\n- Execution Time: {self.execution_time_seconds:.1f}s\n- Screenshots Taken: {self.screenshots_taken}"
+        elif self.requires_human_intervention:
+            return f"⚠️ Human Intervention Required\n\nReason: {self.human_intervention_reason}\n\nCurrent Status: {self.answer}\n\nExecution Summary:\n- Total Interactions: {self.total_interactions}\n- Execution Time: {self.execution_time_seconds:.1f}s\n- Sandbox Preserved: {'Yes' if self.sandbox_preserved else 'No'}\n\nNote: The sandbox has been preserved for you to continue working on this task."
+        else:
+            return f"✗ Task Failed\n\nError: {self.error_message}\n\nExecution Summary:\n- Total Interactions: {self.total_interactions}\n- Execution Time: {self.execution_time_seconds:.1f}s"
+    
+    def __str__(self) -> str:
+        return self.get_formatted_result()
