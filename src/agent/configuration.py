@@ -35,6 +35,10 @@ class AgentConfig(BaseModel):
         default_factory=lambda: os.getenv("OPENAI_API_KEY", ""),
         description="Secret key for the OpenAI API. Set via $OPENAI_API_KEY.",
     )
+    anthropic_api_key: str = Field(
+        default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", ""),
+        description="Secret key for the Anthropic API. Set via $ANTHROPIC_API_KEY.",
+    )
     e2b_api_key: str = Field(
         default_factory=lambda: os.getenv("E2B_API_KEY", ""),
         description="Secret key for the e2b API. Set via $E2B_API_KEY.",
@@ -50,6 +54,14 @@ class AgentConfig(BaseModel):
     model_executor: str = Field(
         default=os.getenv("CUA_EXECUTOR_MODEL", "gpt-4o"),
         description="Computer-Use model used for the executor node.",
+    )
+    brain_provider: str = Field(
+        default=os.getenv("CUA_BRAIN_PROVIDER", "anthropic"),
+        description="LLM provider for the brain node. Options: 'openai' or 'anthropic'.",
+    )
+    brain_model: str = Field(
+        default=os.getenv("CUA_BRAIN_MODEL", "claude-3-5-sonnet-20241022"),
+        description="Model name for the brain node.",
     )
 
     # ---------------------------------------------------------------------
@@ -86,7 +98,7 @@ class AgentConfig(BaseModel):
     # ---------------------------------------------------------------------
     # Validators
     # ---------------------------------------------------------------------
-    @field_validator("openai_api_key", "e2b_api_key", mode="before")
+    @field_validator("e2b_api_key", mode="before")
     def _not_empty(cls, v: str, info: ValidationInfo):  # noqa: D401 – internal helper
         if not v:
             raise ValueError(
