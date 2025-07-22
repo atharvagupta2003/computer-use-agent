@@ -52,15 +52,15 @@ class AgentConfig(BaseModel):
         description="Chat model used for the planner node.",
     )
     model_executor: str = Field(
-        default=os.getenv("CUA_EXECUTOR_MODEL", "gpt-4o"),
+        default=os.getenv("CUA_EXECUTOR_MODEL", "computer-use-preview"),
         description="Computer-Use model used for the executor node.",
     )
     brain_provider: str = Field(
-        default=os.getenv("CUA_BRAIN_PROVIDER", "anthropic"),
+        default=os.getenv("CUA_BRAIN_PROVIDER", "openai"),
         description="LLM provider for the brain node. Options: 'openai' or 'anthropic'.",
     )
     brain_model: str = Field(
-        default=os.getenv("CUA_BRAIN_MODEL", "claude-3-5-sonnet-20241022"),
+        default=os.getenv("CUA_BRAIN_MODEL", "gpt-4o"),
         description="Model name for the brain node.",
     )
 
